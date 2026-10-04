@@ -19,6 +19,10 @@ cmake --build sequencer/build -j2
 
 The default address is `0.0.0.0:50051`. Send `SIGINT` or `SIGTERM` to shut it down cleanly.
 
+Symbol → partition routing is read at startup from `trading-project/config/instruments.json`, the same file every
+engine_node reads (see `../config/README.md`). Override the location with `EXCHANGE_INSTRUMENTS=/path/to/file`.
+A bad file stops the sequencer at startup with the file, entry and field in the message.
+
 ## Tests
 
 ```sh

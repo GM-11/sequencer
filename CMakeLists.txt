@@ -11,6 +11,13 @@ if(NOT TARGET exchange_proto)
   add_subdirectory(${EXCHANGE_PROTO_DIR} ${CMAKE_BINARY_DIR}/proto)
 endif()
 
+# Shared settings (the instrument list), read by every service at startup.
+set(EXCHANGE_CONFIG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../config" CACHE PATH
+    "Path to the shared config folder")
+if(NOT TARGET instrument_config)
+  add_subdirectory(${EXCHANGE_CONFIG_DIR} ${CMAKE_BINARY_DIR}/config)
+endif()
+
 find_package(Threads REQUIRED)
 
 add_library(sequencer_core STATIC src/partition.cpp src/service.cpp)
@@ -20,7 +27,7 @@ target_compile_features(sequencer_core PUBLIC cxx_std_20)
 target_compile_options(sequencer_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(sequencer src/main.cpp)
-target_link_libraries(sequencer PRIVATE sequencer_core)
+target_link_libraries(sequencer PRIVATE sequencer_core instrument_config)
 target_compile_options(sequencer PRIVATE -Wall -Wextra -Wpedantic)
 
 option(SEQUENCER_BUILD_TESTS "Build sequencer tests" ${PROJECT_IS_TOP_LEVEL})
