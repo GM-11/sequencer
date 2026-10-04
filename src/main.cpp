@@ -1,13 +1,12 @@
+#include "config/instruments.hpp"
 #include "sequencer/service.hpp"
 
 #include <chrono>
-#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <pthread.h>
 #include <signal.h>
 #include <string>
-#include <unordered_map>
 
 int main(int argc, char *argv[]) {
     // Block before gRPC creates threads so sigwait is the sole signal receiver.
@@ -18,14 +17,14 @@ int main(int argc, char *argv[]) {
         return 1;
 
     try {
-        sequencer::SequencerConfig config;
-        config.symbol_to_partition = {
-            {1, 0},
-            {2, 0},
-            {3, 1},
-            {4, 1},
-        };
-        config.partition_count = 2;
+        // The same instrument list every engine_node reads: one file, no private copies.
+        const std::string instruments_path = config::instruments_path();
+        const config::InstrumentConfig instruments = config::load_instruments(instruments_path);
+
+        sequencer::SequencerConfig service_config;
+        service_config.partition_count = instruments.partitions;
+        for (const auto &instrument : instruments.instruments)
+            service_config.symbol_to_partition.emplace(instrument.id, instrument.partition);
 
         const sequencer::Clock clock = [] {
             return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -34,7 +33,7 @@ int main(int argc, char *argv[]) {
         };
         const std::string address = argc > 1 ? argv[1] : "0.0.0.0:50051";
 
-        sequencer::SequencerService service(config, clock);
+        sequencer::SequencerService service(service_config, clock);
         grpc::ServerBuilder builder;
         builder.AddListeningPort(address, grpc::InsecureServerCredentials());
         builder.RegisterService(&service);
@@ -44,15 +43,10 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        std::cout << "sequencer listening on " << address << '\n';
-        const std::unordered_map<std::uint32_t, std::string> names = {
-            {1, "MOOG"},
-            {2, "BANANA"},
-            {3, "TESLO"},
-            {4, "MACROHARD"},
-        };
-        for (const auto &[symbol, partition] : config.symbol_to_partition)
-            std::cout << names.at(symbol) << "=" << symbol << " -> partition " << partition << '\n';
+        std::cout << "sequencer listening on " << address << " (instruments v" << instruments.version << " from "
+                  << instruments_path << ")\n";
+        for (const auto &instrument : instruments.instruments)
+            std::cout << instrument.ticker << "=" << instrument.id << " -> partition " << instrument.partition << '\n';
         std::cout << std::flush;
 
         int signal_number = 0;
