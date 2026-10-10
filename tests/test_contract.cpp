@@ -105,13 +105,14 @@ class Gateway {
     Gateway &operator=(const Gateway &) = delete;
 
     // No Catch2 assertions inside, so worker threads may call it (Catch2 asserts are not thread-safe).
-    std::optional<pb::SubmitAck> try_submit(std::uint64_t request_id, std::uint32_t symbol,
-                                            const std::string &payload = "body") {
+    std::optional<pb::SubmitAck> try_submit(std::uint64_t client_request_id, std::uint32_t symbol,
+                                            const std::string &payload = "body", std::uint64_t account_id = 17) {
         pb::SubmitRequest req;
         req.set_gateway_id(id_);
-        req.set_request_id(request_id);
+        req.set_client_request_id(client_request_id);
         req.set_symbol(symbol);
         req.set_payload(payload);
+        req.set_account_id(account_id);
         if (!stream_->Write(req))
             return std::nullopt;
         pb::SubmitAck ack;
@@ -120,8 +121,9 @@ class Gateway {
         return ack;
     }
 
-    pb::SubmitAck submit(std::uint64_t request_id, std::uint32_t symbol, const std::string &payload = "body") {
-        auto ack = try_submit(request_id, symbol, payload);
+    pb::SubmitAck submit(std::uint64_t client_request_id, std::uint32_t symbol, const std::string &payload = "body",
+                         std::uint64_t account_id = 17) {
+        auto ack = try_submit(client_request_id, symbol, payload, account_id);
         REQUIRE(ack.has_value());
         return *ack;
     }
@@ -232,7 +234,8 @@ TEST_CASE("contract: accepted orders get seq 1, 2, 3 and acks come back in reque
 
     for (std::uint64_t i = 1; i <= 3; ++i) {
         const auto ack = gateway.submit(100 + i, MOOG);
-        CHECK(ack.request_id() == 100 + i);
+        CHECK(ack.client_request_id() == 100 + i);
+        CHECK(ack.account_id() == 17);
         CHECK(ack.status() == pb::SUBMIT_STATUS_ACCEPTED);
         CHECK(ack.seq() == i);
     }
@@ -244,7 +247,8 @@ TEST_CASE("contract: an unknown symbol is refused, gets no seq, and uses none up
     Gateway gateway(server.stub(), "gw-1");
 
     const auto refused = gateway.submit(1, 99);
-    CHECK(refused.request_id() == 1);
+    CHECK(refused.client_request_id() == 1);
+    CHECK(refused.account_id() == 17);
     CHECK(refused.status() == pb::SUBMIT_STATUS_UNKNOWN_SYMBOL);
     CHECK(refused.seq() == 0);
 
@@ -255,7 +259,8 @@ TEST_CASE("contract: an unknown symbol is refused, gets no seq, and uses none up
     Engine engine(server.stub(), 0);
     const auto got = engine.take(1);
     CHECK(got[0].seq() == 1);
-    CHECK(got[0].request_id() == 2); // the refused request never reached the engine
+    CHECK(got[0].client_request_id() == 2); // the refused request never reached the engine
+    CHECK(got[0].account_id() == 17);
 }
 
 TEST_CASE("contract: a full partition answers BUSY without using up a seq", "[contract]") {
@@ -269,6 +274,8 @@ TEST_CASE("contract: a full partition answers BUSY without using up a seq", "[co
     CHECK(gateway.submit(2, MOOG).seq() == 2);
     const auto busy = gateway.submit(3, MOOG);
     CHECK(busy.status() == pb::SUBMIT_STATUS_BUSY);
+    CHECK(busy.client_request_id() == 3);
+    CHECK(busy.account_id() == 17);
     CHECK(busy.seq() == 0);
 
     // TESLO lives on the other partition, which still has room.
@@ -283,7 +290,7 @@ TEST_CASE("contract: a full partition answers BUSY without using up a seq", "[co
 
     const auto third = engine.take(1);
     CHECK(third[0].seq() == 3);
-    CHECK(third[0].request_id() == 5);
+    CHECK(third[0].client_request_id() == 5);
 }
 
 TEST_CASE("contract: after stop(), new orders are answered NOT_RUNNING", "[contract]") {
@@ -295,7 +302,8 @@ TEST_CASE("contract: after stop(), new orders are answered NOT_RUNNING", "[contr
     server.service().stop();
 
     const auto ack = gateway.submit(2, MOOG);
-    CHECK(ack.request_id() == 2);
+    CHECK(ack.client_request_id() == 2);
+    CHECK(ack.account_id() == 17);
     CHECK(ack.status() == pb::SUBMIT_STATUS_NOT_RUNNING);
     CHECK(ack.seq() == 0);
 }
@@ -319,9 +327,13 @@ TEST_CASE("contract: the engine receives every field exactly as it was sent, wit
     TestServer server(test_config(), clock.fn());
     Gateway gateway(server.stub(), "gw-alice");
 
-    gateway.submit(41, MOOG, "first");
+    const auto first_ack = gateway.submit(41, MOOG, "first", 901);
+    CHECK(first_ack.client_request_id() == 41);
+    CHECK(first_ack.account_id() == 901);
     clock.now = 1'696'330'000'128;
-    gateway.submit(42, BANANA, "second");
+    const auto second_ack = gateway.submit(42, BANANA, "second", 902);
+    CHECK(second_ack.client_request_id() == 42);
+    CHECK(second_ack.account_id() == 902);
 
     Engine engine(server.stub(), 0);
     const auto got = engine.take(2);
@@ -329,15 +341,17 @@ TEST_CASE("contract: the engine receives every field exactly as it was sent, wit
     CHECK(got[0].seq() == 1);
     CHECK(got[0].ts() == 1'696'330'000'123);
     CHECK(got[0].symbol() == MOOG);
-    CHECK(got[0].request_id() == 41);
+    CHECK(got[0].client_request_id() == 41);
     CHECK(got[0].gateway_id() == "gw-alice");
+    CHECK(got[0].account_id() == 901);
     CHECK(got[0].payload() == "first");
 
     CHECK(got[1].seq() == 2);
     CHECK(got[1].ts() == 1'696'330'000'128);
     CHECK(got[1].symbol() == BANANA);
-    CHECK(got[1].request_id() == 42);
+    CHECK(got[1].client_request_id() == 42);
     CHECK(got[1].gateway_id() == "gw-alice");
+    CHECK(got[1].account_id() == 902);
     CHECK(got[1].payload() == "second");
 }
 
@@ -433,7 +447,8 @@ TEST_CASE("contract: when an engine disconnects, its seat is freed for the next 
     Engine second(server.stub(), 0, 2); // resume exactly where the first one stopped
     const auto got = second.take(1);
     CHECK(got[0].seq() == 2);
-    CHECK(got[0].request_id() == 2);
+    CHECK(got[0].client_request_id() == 2);
+    CHECK(got[0].account_id() == 17);
 }
 
 TEST_CASE("contract: a command whose delivery fails stays queued for the next subscriber", "[contract]") {
@@ -451,13 +466,14 @@ TEST_CASE("contract: a command whose delivery fails stays queued for the next su
 
     // Seq 2 wakes the parked handler. Its Write fails because the call is gone,
     // so seq 2 must stay queued instead of being thrown away.
-    CHECK(gateway.submit(2, MOOG).seq() == 2);
+    CHECK(gateway.submit(2, MOOG, "body", 903).seq() == 2);
 
     wait_until_seat_free(server.stub(), 0);
     Engine second(server.stub(), 0, 2);
     const auto got = second.take(1);
     CHECK(got[0].seq() == 2);
-    CHECK(got[0].request_id() == 2);
+    CHECK(got[0].client_request_id() == 2);
+    CHECK(got[0].account_id() == 903);
 }
 
 TEST_CASE("contract: four gateways at once still give one gap-free stream that matches the acks", "[contract]") {
@@ -504,10 +520,11 @@ TEST_CASE("contract: four gateways at once still give one gap-free stream that m
         std::uint64_t last_seq = 0;
         for (std::uint64_t i = 0; i < kPerGateway; ++i) {
             const auto &ack = acks[g][i];
-            if (ack.request_id() != i + 1 || ack.status() != pb::SUBMIT_STATUS_ACCEPTED || ack.seq() <= last_seq)
+            if (ack.client_request_id() != i + 1 || ack.account_id() != 17 ||
+                ack.status() != pb::SUBMIT_STATUS_ACCEPTED || ack.seq() <= last_seq)
                 ++bad_acks;
             last_seq = ack.seq();
-            owner[ack.seq()] = {"gw-" + std::to_string(g), ack.request_id()};
+            owner[ack.seq()] = {"gw-" + std::to_string(g), ack.client_request_id()};
         }
     }
     CHECK(bad_acks == 0);
@@ -520,7 +537,7 @@ TEST_CASE("contract: four gateways at once still give one gap-free stream that m
         const auto &command = received[i];
         const auto it = owner.find(command.seq());
         if (command.seq() != i + 1 || it == owner.end() || command.gateway_id() != it->second.first ||
-            command.request_id() != it->second.second)
+            command.client_request_id() != it->second.second || command.account_id() != 17)
             ++mismatches;
     }
     CHECK(mismatches == 0);
