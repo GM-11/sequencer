@@ -30,7 +30,7 @@ AppendResult Partition::append(const pb::SubmitRequest &req) {
         command.set_seq(seq);
         command.set_ts(ts);
         command.set_symbol(req.symbol());
-        command.set_client_request_id(req.client_request_id());
+        command.set_client_order_id(req.client_order_id());
         command.set_gateway_id(req.gateway_id());
         command.set_account_id(req.account_id());
         command.set_payload(req.payload());

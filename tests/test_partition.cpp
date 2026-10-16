@@ -30,11 +30,11 @@ sequencer::Clock fixed_clock(std::int64_t now) {
     return [now] { return now; };
 }
 
-pb::SubmitRequest request(std::uint64_t client_request_id, std::uint32_t symbol = 1, std::string gateway = "gw-1",
+pb::SubmitRequest request(std::uint64_t client_order_id, std::uint32_t symbol = 1, std::string gateway = "gw-1",
                           std::string payload = "body", std::uint64_t account_id = 17) {
     pb::SubmitRequest r;
     r.set_gateway_id(std::move(gateway));
-    r.set_client_request_id(client_request_id);
+    r.set_client_order_id(std::to_string(client_order_id));
     r.set_symbol(symbol);
     r.set_payload(std::move(payload));
     r.set_account_id(account_id);
@@ -67,7 +67,7 @@ TEST_CASE("partition: seq starts at 1, has no gaps, and every field is copied", 
         CHECK(got[i].seq() == i + 1);
         CHECK(got[i].ts() == 5000);
         CHECK(got[i].symbol() == 2);
-        CHECK(got[i].client_request_id() == 41 + i);
+        CHECK(got[i].client_order_id() == std::to_string(41 + i));
         CHECK(got[i].gateway_id() == "gw-7");
         CHECK(got[i].account_id() == 901 + i);
         CHECK(got[i].payload() == "payload-" + std::to_string(i + 1));
@@ -195,9 +195,11 @@ TEST_CASE("partition: four threads appending at once still give 1..N in queue or
         if (got[i].seq() != i + 1)
             ++out_of_order;
         auto &last = last_request[got[i].gateway_id()];
-        if (got[i].client_request_id() <= last)
+        // The test made these ids from counters, so they parse back to numbers.
+        const std::uint64_t id = std::stoull(got[i].client_order_id());
+        if (id <= last)
             ++out_of_order; // one thread's requests must keep their own order
-        last = got[i].client_request_id();
+        last = id;
     }
     CHECK(out_of_order == 0);
 }

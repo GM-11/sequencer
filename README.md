@@ -2,7 +2,7 @@
 
 A synchronous gRPC relay that assigns per-partition sequence numbers to gateway commands and streams them to the engine. Durable journaling, replay, and business logic are intentionally deferred.
 
-`SubmitRequest` carries a `client_request_id` and `account_id`. Every `SubmitAck` echoes both fields (including rejected requests), and accepted `SequencedCommand`s carry them unchanged to the engine. Routing still depends only on `symbol`; the sequencer never opens `payload`.
+`SubmitRequest` carries a `client_order_id` and `account_id`. Every `SubmitAck` echoes both fields (including rejected requests), and accepted `SequencedCommand`s carry them unchanged to the engine. Routing still depends only on `symbol`; the sequencer never opens `payload`.
 
 ## Build
 

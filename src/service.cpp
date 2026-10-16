@@ -30,7 +30,7 @@ grpc::Status SequencerService::Submit(grpc::ServerContext *,
             return {grpc::StatusCode::INVALID_ARGUMENT, "gateway_id is required"};
 
         pb::SubmitAck ack;
-        ack.set_client_request_id(req.client_request_id());
+        ack.set_client_order_id(req.client_order_id());
         ack.set_account_id(req.account_id());
         if (!running_) {
             ack.set_status(pb::SUBMIT_STATUS_NOT_RUNNING);
