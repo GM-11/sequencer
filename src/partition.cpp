@@ -18,8 +18,17 @@ AppendResult Partition::append(const pb::SubmitRequest &req) {
     {
         // One lock keeps sequence assignment, timestamping, and enqueueing inseparable.
         std::lock_guard lock(mu_);
+        // A resend answers with the original seq and is not appended again.
+        // Checked before the capacity test: a duplicate needs no room. The
+        // lookup, the append and the insert below all happen under this one
+        // lock, or two concurrent copies would both be appended.
+        // Cancels/modifies send an empty client_order_id and are never deduped.
+        if (!req.client_order_id().empty()) {
+            if (const auto it = seen_.find({req.account_id(), req.client_order_id()}); it != seen_.end())
+                return {AppendStatus::Accepted, it->second};
+        }
         if (queue_.size() >= capacity_)
-            return {AppendStatus::Busy, 0};
+            return {AppendStatus::Busy, 0}; // leaves no entry: a retry is a fresh submit
 
         // A wall clock can move backward; timestamps must not as sequences increase.
         const std::int64_t ts = std::max(clock_(), last_ts_);
@@ -35,6 +44,8 @@ AppendResult Partition::append(const pb::SubmitRequest &req) {
         command.set_account_id(req.account_id());
         command.set_payload(req.payload());
         queue_.push_back(std::move(command));
+        if (!req.client_order_id().empty())
+            seen_.emplace(std::make_pair(req.account_id(), req.client_order_id()), seq);
     }
     cv_.notify_one();
     return {AppendStatus::Accepted, seq};

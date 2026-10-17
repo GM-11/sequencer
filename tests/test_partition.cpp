@@ -179,7 +179,9 @@ TEST_CASE("partition: four threads appending at once still give 1..N in queue or
         for (int t = 0; t < kThreads; ++t) {
             threads.emplace_back([&, t] {
                 for (std::uint64_t i = 1; i <= kPerThread; ++i)
-                    if (p.append(request(i, 1, "gw-" + std::to_string(t))).status != AppendStatus::Accepted)
+                    // One account per thread: the same (account, id) twice would be a resend, not a new order.
+                    if (p.append(request(i, 1, "gw-" + std::to_string(t), "body", 17 + t)).status !=
+                        AppendStatus::Accepted)
                         ++refused;
             });
         }
@@ -233,4 +235,81 @@ TEST_CASE("service: a bad config is rejected at startup, not on the first order"
     CHECK_THROWS_AS(sequencer::SequencerService(no_room, fixed_clock(1)), std::invalid_argument);
 
     CHECK_THROWS_AS(sequencer::SequencerService(ok, sequencer::Clock{}), std::invalid_argument);
+}
+
+// ------------------------------------------------------------------ dedupe
+
+TEST_CASE("partition dedupe: a resend answers Accepted with the original seq and is not queued again", "[partition]") {
+    Partition p(10, fixed_clock(1));
+    const auto first = p.append(request(5));
+    const auto other = p.append(request(6));
+    const auto resend = p.append(request(5));
+    CHECK(first.status == AppendStatus::Accepted);
+    CHECK(resend.status == AppendStatus::Accepted);
+    CHECK(resend.seq == first.seq);
+    CHECK(other.seq == first.seq + 1);
+    CHECK(p.append(request(7)).seq == other.seq + 1); // the resend used no seq
+    CHECK(drain(p).size() == 3);
+}
+
+TEST_CASE("partition dedupe: the same client order id from different accounts is not a duplicate", "[partition]") {
+    Partition p(10, fixed_clock(1));
+    const auto a = p.append(request(5, 1, "gw", "body", 17));
+    const auto b = p.append(request(5, 1, "gw", "body", 18));
+    CHECK(a.seq != b.seq);
+    CHECK(drain(p).size() == 2);
+}
+
+TEST_CASE("partition dedupe: an empty client order id is never deduped", "[partition]") {
+    Partition p(10, fixed_clock(1));
+    pb::SubmitRequest cancel = request(1);
+    cancel.set_client_order_id("");
+    const auto a = p.append(cancel);
+    const auto b = p.append(cancel);
+    CHECK(a.status == AppendStatus::Accepted);
+    CHECK(b.status == AppendStatus::Accepted);
+    CHECK(a.seq != b.seq);
+    CHECK(drain(p).size() == 2);
+}
+
+TEST_CASE("partition dedupe: a Busy attempt leaves no entry, so the retry gets a fresh seq", "[partition]") {
+    Partition p(1, fixed_clock(1));
+    REQUIRE(p.append(request(1)).status == AppendStatus::Accepted);
+    CHECK(p.append(request(2)).status == AppendStatus::Busy);
+    drain(p); // makes room
+    const auto retry = p.append(request(2));
+    CHECK(retry.status == AppendStatus::Accepted);
+    CHECK(retry.seq == 2); // not 3: Busy used no seq
+    const auto got = drain(p);
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].client_order_id() == "2");
+}
+
+TEST_CASE("partition dedupe: a resend of an order already delivered still answers its original seq", "[partition]") {
+    Partition p(10, fixed_clock(1));
+    const auto first = p.append(request(5));
+    drain(p);
+    const auto resend = p.append(request(5));
+    CHECK(resend.seq == first.seq);
+    CHECK(drain(p).empty());
+}
+
+TEST_CASE("partition dedupe: many threads sending the same order append it exactly once", "[partition]") {
+    constexpr int kThreads = 8;
+    constexpr std::uint64_t kOrders = 200;
+    Partition p(kOrders * kThreads, fixed_clock(1));
+    std::vector<std::vector<std::uint64_t>> seqs(kThreads);
+    {
+        std::vector<std::jthread> threads;
+        for (int t = 0; t < kThreads; ++t)
+            threads.emplace_back([&, t] {
+                for (std::uint64_t i = 1; i <= kOrders; ++i)
+                    seqs[t].push_back(p.append(request(i)).seq);
+            });
+    }
+    const auto got = drain(p);
+    CHECK(got.size() == kOrders); // not kOrders * kThreads
+    for (std::uint64_t i = 0; i < kOrders; ++i)
+        for (int t = 1; t < kThreads; ++t)
+            CHECK(seqs[t][i] == seqs[0][i]); // every copy was told the same seq
 }

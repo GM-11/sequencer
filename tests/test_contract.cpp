@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -502,7 +503,8 @@ TEST_CASE("contract: four gateways at once still give one gap-free stream that m
             gateways.emplace_back([&, g] {
                 Gateway gateway(server.stub(), "gw-" + std::to_string(g));
                 for (std::uint64_t r = 1; r <= kPerGateway; ++r) {
-                    auto ack = gateway.try_submit(r, r % 2 ? MOOG : BANANA);
+                    // One account per gateway: the same (account, id) twice would be a resend, not a new order.
+                    auto ack = gateway.try_submit(r, r % 2 ? MOOG : BANANA, "body", 17 + g);
                     if (!ack)
                         return;
                     acks[g].push_back(*ack);
@@ -520,7 +522,7 @@ TEST_CASE("contract: four gateways at once still give one gap-free stream that m
         std::uint64_t last_seq = 0;
         for (std::uint64_t i = 0; i < kPerGateway; ++i) {
             const auto &ack = acks[g][i];
-            if (ack.client_order_id() != std::to_string(i + 1) || ack.account_id() != 17 ||
+            if (ack.client_order_id() != std::to_string(i + 1) || ack.account_id() != static_cast<std::uint64_t>(17 + g) ||
                 ack.status() != pb::SUBMIT_STATUS_ACCEPTED || ack.seq() <= last_seq)
                 ++bad_acks;
             last_seq = ack.seq();
@@ -537,7 +539,8 @@ TEST_CASE("contract: four gateways at once still give one gap-free stream that m
         const auto &command = received[i];
         const auto it = owner.find(command.seq());
         if (command.seq() != i + 1 || it == owner.end() || command.gateway_id() != it->second.first ||
-            command.client_order_id() != it->second.second || command.account_id() != 17)
+            command.client_order_id() != it->second.second ||
+            "gw-" + std::to_string(command.account_id() - 17) != command.gateway_id())
             ++mismatches;
     }
     CHECK(mismatches == 0);
@@ -586,4 +589,136 @@ TEST_CASE("relay only: with no history, a subscriber can only resume at the next
     const auto replay = subscribe_rejection(server.stub(), 0, 1);
     CHECK(replay.error_code() == grpc::StatusCode::OUT_OF_RANGE);
     CHECK(replay.error_message().find("next seq is 3") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dedupe: a resend of (account_id, client_order_id) is not appended again
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("contract: the same (account, client order id) twice gets the same seq and reaches the engine once",
+          "[contract]") {
+    FakeClock clock;
+    TestServer server(test_config(), clock.fn());
+    Gateway gateway(server.stub(), "gw-1");
+
+    const auto first = gateway.submit(7, MOOG);
+    const auto again = gateway.submit(7, MOOG);
+    const auto next = gateway.submit(8, MOOG);
+    CHECK(first.status() == pb::SUBMIT_STATUS_ACCEPTED);
+    CHECK(again.status() == pb::SUBMIT_STATUS_ACCEPTED);
+    CHECK(again.seq() == first.seq());
+    CHECK(again.client_order_id() == "7");
+    CHECK(next.seq() == first.seq() + 1);
+
+    Engine engine(server.stub(), 0);
+    const auto got = engine.take(2);
+    CHECK(got[0].client_order_id() == "7");
+    CHECK(got[1].client_order_id() == "8"); // nothing between them: the resend was not forwarded
+}
+
+TEST_CASE("contract: the same client order id from two accounts is two orders", "[contract]") {
+    FakeClock clock;
+    TestServer server(test_config(), clock.fn());
+    Gateway gateway(server.stub(), "gw-1");
+
+    const auto a = gateway.submit(7, MOOG, "body", 17);
+    const auto b = gateway.submit(7, MOOG, "body", 18);
+    CHECK(a.seq() != b.seq());
+
+    Engine engine(server.stub(), 0);
+    const auto got = engine.take(2);
+    CHECK(got[0].account_id() == 17);
+    CHECK(got[1].account_id() == 18);
+}
+
+TEST_CASE("contract: an empty client order id is never deduped", "[contract]") {
+    FakeClock clock;
+    TestServer server(test_config(), clock.fn());
+    pb::SubmitRequest req;
+    req.set_gateway_id("gw-1");
+    req.set_symbol(MOOG);
+    req.set_account_id(17);
+    req.set_payload("cancel");
+
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kCallDeadline);
+    auto stream = server.stub().Submit(&ctx);
+    pb::SubmitAck a, b;
+    REQUIRE(stream->Write(req));
+    REQUIRE(stream->Read(&a));
+    REQUIRE(stream->Write(req));
+    REQUIRE(stream->Read(&b));
+    CHECK(a.seq() == 1);
+    CHECK(b.seq() == 2);
+    stream->WritesDone();
+    stream->Finish();
+
+    Engine engine(server.stub(), 0);
+    CHECK(engine.take(2).size() == 2);
+}
+
+TEST_CASE("contract: BUSY, then a retry of the same order once there is room, is accepted with a fresh seq",
+          "[contract]") {
+    auto config = test_config();
+    config.queue_capacity = 1;
+    FakeClock clock;
+    TestServer server(config, clock.fn());
+    Gateway gateway(server.stub(), "gw-1");
+
+    CHECK(gateway.submit(1, MOOG).seq() == 1);
+    CHECK(gateway.submit(2, MOOG).status() == pb::SUBMIT_STATUS_BUSY);
+
+    Engine engine(server.stub(), 0);
+    engine.take(1);
+    // Seq 1 has gone out; wait until the queue has room again.
+    pb::SubmitAck retry;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        retry = gateway.submit(2, MOOG);
+        if (retry.status() != pb::SUBMIT_STATUS_BUSY)
+            break;
+        std::this_thread::sleep_for(10ms);
+    }
+    CHECK(retry.status() == pb::SUBMIT_STATUS_ACCEPTED);
+    CHECK(retry.seq() == 2); // the BUSY attempt left no entry and used no seq
+
+    const auto got = engine.take(1);
+    CHECK(got[0].seq() == 2);
+    CHECK(got[0].client_order_id() == "2");
+}
+
+TEST_CASE("contract: duplicates sent concurrently from several streams are appended exactly once", "[contract]") {
+    constexpr int kStreams = 4;
+    constexpr std::uint64_t kOrders = 200;
+    FakeClock clock;
+    TestServer server(test_config(), clock.fn());
+
+    std::vector<std::vector<std::uint64_t>> seqs(kStreams);
+    {
+        std::vector<std::jthread> threads;
+        for (int s = 0; s < kStreams; ++s)
+            threads.emplace_back([&, s] {
+                Gateway gateway(server.stub(), "gw-" + std::to_string(s));
+                for (std::uint64_t id = 1; id <= kOrders; ++id) {
+                    auto ack = gateway.try_submit(id, MOOG); // every stream sends the same 200 orders, same account
+                    if (!ack)
+                        return;
+                    seqs[s].push_back(ack->seq());
+                }
+            });
+    }
+    for (int s = 0; s < kStreams; ++s)
+        REQUIRE(seqs[s].size() == kOrders);
+    for (std::uint64_t i = 0; i < kOrders; ++i)
+        for (int s = 1; s < kStreams; ++s)
+            CHECK(seqs[s][i] == seqs[0][i]);
+
+    Engine engine(server.stub(), 0);
+    const auto got = engine.take(kOrders);
+    std::set<std::string> ids;
+    for (const auto &c : got)
+        ids.insert(c.client_order_id());
+    CHECK(ids.size() == kOrders);
+    // Exactly kOrders were appended: the next new order is seq kOrders + 1.
+    Gateway probe(server.stub(), "probe");
+    CHECK(probe.submit(kOrders + 1, MOOG).seq() == kOrders + 1);
 }
